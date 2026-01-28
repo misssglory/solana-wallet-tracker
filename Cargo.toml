@@ -1,0 +1,24 @@
+[package]
+name = "solana-portfolio-tracker"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+solana-client = "3.1.8"
+solana-sdk = "3.0.0"
+solana-program = "3.0.0"
+solana-account-decoder = "3.1.8"
+solana-commitment-config = "3.1.0"
+tokio-stream = "0.1"
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1.0"
+thiserror = "1.0"
+dashmap = "5.5"
+chrono = "0.4"
+spl-token = "9.0.0"
+dotenvy = "0.15.7"
