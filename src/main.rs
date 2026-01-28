@@ -14,12 +14,12 @@ use solana_sdk::signature::Signature;
 use spl_token;
 use tokio::sync::Mutex;
 use tokio::time::interval;
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, debug};
 use solana_program::program_pack::Pack;
 use spl_token::state::Account as TokenAccount;
-use tokio::sync::RwLock; // Recommended for async thread-safety
+use tokio::sync::RwLock;
 use spl_token::state::Mint;
-
+use colored::*; // Add colored crate for better output
 
 #[derive(Debug, Clone)]
 pub struct TokenBalance {
@@ -67,12 +67,101 @@ impl PortfolioTracker {
         }
     }
 
-    /// Fetch all token accounts for a wallet
-
-    pub async fn fetch_token_balances(&self) -> anyhow::Result<HashMap<Pubkey, TokenBalance>> {
-
+    /// Log initial portfolio with detailed information
+    pub async fn log_initial_portfolio(&self) -> anyhow::Result<()> {
+        info!("{}", "=".repeat(80).green());
+        info!("{}", "INITIAL PORTFOLIO SNAPSHOT".bold().green());
+        info!("{}", "=".repeat(80).green());
         
+        info!("Wallet Address: {}", self.wallet_address.to_string().cyan());
+        info!("Timestamp: {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string().cyan());
+        
+        let balances = self.fetch_token_balances().await?;
+        
+        if balances.is_empty() {
+            info!("{}", "No token holdings found in wallet".yellow());
+            return Ok(());
+        }
+        
+        // Calculate total value
+        let mut total_value = 0.0;
+        let mut balance_vec: Vec<(&Pubkey, &TokenBalance)> = balances.iter().collect();
+        
+        // Sort by token amount (highest first)
+        balance_vec.sort_by(|a, b| {
+            b.1.ui_amount.partial_cmp(&a.1.ui_amount).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        
+        info!("");
+        info!("{}", "TOKEN HOLDINGS:".bold());
+        info!("{}", "-".repeat(80));
+        
+        for (i, (mint, balance)) in balance_vec.iter().enumerate() {
+            let symbol = balance.symbol.as_deref().unwrap_or("UNKNOWN");
+            let name = balance.name.as_deref().unwrap_or("Unknown Token");
+            
+            // Get token price if available
+            let price = self.get_token_price(**mint).await;
+            let token_value = price.map(|p| balance.ui_amount * p);
+            
+            if let Some(value) = token_value {
+                total_value += value;
+            }
+            
+            info!("{}. {} ({})", i + 1, symbol.bold(), name);
+            info!("   Mint: {}", mint.to_string().dimmed());
+            info!("   Balance: {:.8}", balance.ui_amount);
+            info!("   Amount: {} (decimals: {})", balance.amount, balance.decimals);
+            
+            if let Some(price_val) = price {
+                info!("   Price: ${:.8}", price_val);
+                if let Some(value) = token_value {
+                    info!("   Value: ${:.4}", value);
+                }
+            } else {
+                info!("   Price: {}", "Not available".dimmed());
+            }
+            info!("");
+        }
+        
+        // Summary
+        info!("{}", "=".repeat(80));
+        info!("{}", "PORTFOLIO SUMMARY".bold().green());
+        info!("{}", "-".repeat(80));
+        info!("Total Tokens: {}", balances.len());
+        
+        let sol_balance = self.fetch_sol_balance().await?;
+        info!("SOL Balance: ◎{:.8}", sol_balance);
+        
+        // Try to get SOL price
+        if let Some(sol_price) = self.get_sol_price().await {
+            let sol_value = sol_balance * sol_price;
+            total_value += sol_value;
+            info!("SOL Value: ${:.2}", sol_value);
+        }
+        
+        info!("{}", "-".repeat(80));
+        info!("{} Total Portfolio Value: ${:.2}", "➤".green(), total_value);
+        info!("{}", "=".repeat(80).green());
+        
+        Ok(())
+    }
+    
+    /// Fetch SOL balance
+    async fn fetch_sol_balance(&self) -> anyhow::Result<f64> {
+        let balance = self.rpc_client.get_balance(&self.wallet_address).await?;
+        Ok(balance as f64 / 10f64.powi(9)) // Convert lamports to SOL
+    }
+    
+    /// Get SOL price (placeholder - implement real price feed)
+    async fn get_sol_price(&self) -> Option<f64> {
+        // In a real implementation, fetch from price oracle
+        // For now, return None or a placeholder
+        None
+    }
 
+    /// Fetch all token accounts for a wallet
+    pub async fn fetch_token_balances(&self) -> anyhow::Result<HashMap<Pubkey, TokenBalance>> {
         let filters = vec![
             RpcFilterType::DataSize(TokenAccount::LEN as u64), // 165 bytes
             RpcFilterType::Memcmp(Memcmp::new_base58_encoded(
@@ -97,14 +186,23 @@ impl PortfolioTracker {
 
         let mut balances = HashMap::new();
 
-        for (_pubkey, account) in accounts {
-            // Direct unpacking of binary data into the TokenAccount struct
+        info!("Found {} token accounts", accounts.len());
+
+        for (pubkey, account) in &accounts {
+            debug!("Processing token account: {}", pubkey);
+            
             if let Ok(token_account) = TokenAccount::unpack(&account.data) {
                 if token_account.amount > 0 {
                     let mint = token_account.mint;
                     
-                    // Fetch decimals from Mint account (or use a local cache/registry)
-                    let decimals = self.get_mint_decimals(mint).await?; 
+                    // Fetch decimals from Mint account
+                    let decimals = match self.get_mint_decimals(mint).await {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!("Failed to get decimals for mint {}: {}", mint, e);
+                            continue;
+                        }
+                    };
 
                     let balance = TokenBalance {
                         mint,
@@ -120,6 +218,7 @@ impl PortfolioTracker {
             }
         }
 
+        info!("Found {} tokens with non-zero balance", balances.len());
         Ok(balances)
     }
 
@@ -180,9 +279,48 @@ impl PortfolioTracker {
     }
 
     async fn fetch_token_metadata(&self, mint: Pubkey) -> anyhow::Result<(String, String)> {
-        // Implement metadata fetching from token registry or Metaplex
-        // This is a placeholder - implement based on your needs
-        Ok(("UNKNOWN".to_string(), "Unknown Token".to_string()))
+        // Enhanced metadata fetching - try multiple sources
+        info!("Fetching metadata for mint: {}", mint);
+        
+        // First try to get from known token lists
+        if let Ok(metadata) = self.fetch_from_token_list(mint).await {
+            return Ok(metadata);
+        }
+        
+        // Then try Metaplex metadata
+        if let Ok(metadata) = self.fetch_metaplex_metadata(mint).await {
+            return Ok(metadata);
+        }
+        
+        // Fallback to mint address
+        Ok((format!("TOKEN_{:.4}", &mint.to_string()[0..8]), "Unknown Token".to_string()))
+    }
+    
+    async fn fetch_from_token_list(&self, mint: Pubkey) -> anyhow::Result<(String, String)> {
+        // Implement token list fetching (e.g., from Jupiter token list)
+        // This is a simplified version
+        let mint_str = mint.to_string();
+        
+        // Check known tokens
+        let known_tokens: HashMap<&str, (&str, &str)> = [
+            ("So11111111111111111111111111111111111111112", ("SOL", "Wrapped SOL")),
+            ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", ("USDC", "USD Coin")),
+            ("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", ("USDT", "USD Tether")),
+        ]
+        .iter()
+        .cloned()
+        .collect();
+        
+        if let Some((symbol, name)) = known_tokens.get(mint_str.as_str()) {
+            return Ok((symbol.to_string(), name.to_string()));
+        }
+        
+        Err(anyhow::anyhow!("Token not in known list"))
+    }
+    
+    async fn fetch_metaplex_metadata(&self, mint: Pubkey) -> anyhow::Result<(String, String)> {
+        // Placeholder for Metaplex metadata fetching
+        Err(anyhow::anyhow!("Metaplex metadata not implemented"))
     }
 
     /// Take a snapshot of current portfolio
@@ -230,10 +368,26 @@ impl PortfolioTracker {
         }
     }
 
-    async fn fetch_external_price(&self, _mint: Pubkey) -> anyhow::Result<f64> {
+    async fn fetch_external_price(&self, mint: Pubkey) -> anyhow::Result<f64> {
         // Implement price fetching from external API
-        // Example: Jupiter price API, Birdeye, etc.
-        Ok(0.0) // Placeholder
+        // Example: Jupiter price API
+        let mint_str = mint.to_string();
+        
+        // Known token prices (for demo purposes)
+        let known_prices: HashMap<&str, f64> = [
+            ("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", 1.0), // USDC
+            ("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", 1.0), // USDT
+        ]
+        .iter()
+        .cloned()
+        .collect();
+        
+        if let Some(&price) = known_prices.get(mint_str.as_str()) {
+            return Ok(price);
+        }
+        
+        // For other tokens, return 0.0 (placeholder)
+        Ok(0.0)
     }
 
     /// Compare two snapshots and return differences
@@ -287,11 +441,19 @@ impl PortfolioTracker {
     ) -> anyhow::Result<()> {
         let mut interval = interval(Duration::from_millis(tick_interval_ms));
         
-        // Initial snapshot
+        // Initial snapshot with logging
+        info!("{}", "Taking initial portfolio snapshot...".cyan());
         let initial_snapshot = self.take_snapshot().await?;
+        
+        // Log initial portfolio
+        if let Err(e) = self.log_initial_portfolio().await {
+            error!("Failed to log initial portfolio: {}", e);
+        }
+        
         *self.current_snapshot.lock().await = Some(initial_snapshot.clone());
         
         info!("Started tracking wallet: {}", self.wallet_address);
+        info!("Tracking interval: {}ms", tick_interval_ms);
         
         loop {
             interval.tick().await;
@@ -313,7 +475,7 @@ impl PortfolioTracker {
                     *self.current_snapshot.lock().await = Some(new_snapshot);
                     
                     let elapsed = start_time.elapsed();
-                    info!("Tick completed in {:?}", elapsed);
+                    debug!("Tick completed in {:?}", elapsed);
                 }
                 Err(e) => {
                     error!("Error taking snapshot: {}", e);
@@ -345,39 +507,40 @@ pub struct TokenChange {
     pub percentage_change: f64,
 }
 
-// Custom error type
-#[derive(thiserror::Error, Debug)]
-pub enum TrackerError {
-    #[error("RPC error: {0}")]
-    RpcError(#[from] solana_client::client_error::ClientError),
-    #[error("Parse error: {0}")]
-    ParseError(String),
-    #[error("IO error: {0}")]
-    IoError(#[from] std::io::Error),
-}
-
-// Helper function for Pubkey parsing (no longer needed, using std::str::FromStr directly)
-
 fn main() -> anyhow::Result<()> {
-    // Initialize logging
-    tracing_subscriber::fmt::init();
+    // Initialize logging with colors
+    tracing_subscriber::fmt()
+        .with_ansi(true)
+        .with_level(true)
+        .with_target(true)
+        .init();
 
     dotenvy::dotenv().ok(); 
 
     tokio::runtime::Runtime::new()?.block_on(async {
-        // Use your RPC endpoint (consider using multiple for redundancy)
+        // Use your RPC endpoint
         let rpc_url = std::env::var("SOLANA_RPC_URL")
             .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
         
-        // Replace with the wallet address you want to track
+        // Wallet address to track
         let wallet_address_str = std::env::var("WALLET_ADDRESS")
-            .unwrap_or_else(|_| "YOUR_WALLET_HERE".to_string());
+            .unwrap_or_else(|_| {
+                // Example wallet for demo (Raydium LP wallet)
+                "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1".to_string()
+            });
         
-        println!("Wallet: {:?}", wallet_address_str); 
-
+        info!("Initializing portfolio tracker...");
+        info!("RPC URL: {}", rpc_url);
+        info!("Wallet Address: {}", wallet_address_str);
+        
         let wallet_address = Pubkey::from_str(&wallet_address_str)?;
         
         let tracker = Arc::new(PortfolioTracker::new(rpc_url, wallet_address));
+        
+        // Log initial portfolio before starting tracking
+        if let Err(e) = tracker.log_initial_portfolio().await {
+            error!("Failed to log initial portfolio: {}", e);
+        }
         
         // Start tracking with 5 second intervals
         let tracker_clone = tracker.clone();
@@ -385,26 +548,35 @@ fn main() -> anyhow::Result<()> {
             if let Err(e) = tracker_clone
                 .start_tracking(5000, |diff| {
                     if !diff.is_empty() {
-                        info!("Portfolio changes detected:");
+                        info!("{}", "Portfolio changes detected:".bold().yellow());
                         
                         for added in &diff.added {
-                            info!("  + Added: {} ({}) - {}", 
+                            info!("  {} Added: {} ({}) - {:.8}", 
+                                "+".green(),
                                 added.symbol.as_deref().unwrap_or("Unknown"),
-                                added.mint,
+                                added.mint.to_string()[0..8].to_string().dimmed(),
                                 added.ui_amount
                             );
                         }
                         
                         for removed in &diff.removed {
-                            info!("  - Removed: {} ({})", 
+                            info!("  {} Removed: {} ({})", 
+                                "-".red(),
                                 removed.symbol.as_deref().unwrap_or("Unknown"),
-                                removed.mint
+                                removed.mint.to_string()[0..8].to_string().dimmed()
                             );
                         }
                         
                         for change in &diff.changes {
-                            info!("  Δ Changed: {} - {} → {} (Δ: {:.4}, {:.2}%)", 
-                                change.mint,
+                            let change_emoji = if change.change > 0.0 {
+                                "↑".green()
+                            } else {
+                                "↓".red()
+                            };
+                            
+                            info!("  {} Changed: {} - {:.8} → {:.8} (Δ: {:+.8}, {:.2}%)", 
+                                change_emoji,
+                                change.mint.to_string()[0..8].to_string().dimmed(),
                                 change.old_amount,
                                 change.new_amount,
                                 change.change,
@@ -418,6 +590,8 @@ fn main() -> anyhow::Result<()> {
                 error!("Tracking error: {}", e);
             }
         });
+        
+        info!("Portfolio tracker is running. Press Ctrl+C to stop.");
         
         // Keep the program running
         tokio::signal::ctrl_c().await?;
