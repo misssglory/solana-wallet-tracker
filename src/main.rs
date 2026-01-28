@@ -9,7 +9,10 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
 use solana_client::rpc_filter::{Memcmp, RpcFilterType};
 // use solana_client::rpc_request::TokenAccountOpts;
-use colored::*;
+// use colored::*;
+extern crate colored; // not needed in Rust 2018+
+
+use colored::Colorize;
 use solana_account_decoder_client_types::token::UiTokenAccount;
 use solana_client::rpc_request::TokenAccountsFilter;
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
@@ -177,13 +180,25 @@ impl PortfolioTracker {
 
     /// Fetch all token accounts for a wallet
     pub async fn fetch_token_balances(&self) -> anyhow::Result<HashMap<Pubkey, TokenBalance>> {
-        let filter = TokenAccountsFilter::ProgramId(spl_token_2022::id());
+        // Fetch accounts for both SPL Token and SPL Token-2022 programs
+        let filter_spl = TokenAccountsFilter::ProgramId(spl_token::id()); // Standard SPL Token
+        let filter_spl_2022 = TokenAccountsFilter::ProgramId(spl_token_2022::id()); // SPL Token-2022
 
-        let accounts = self
+        let mut accounts_spl = self
             .rpc_client
-            .get_token_accounts_by_owner(&self.wallet_address, filter)
+            .get_token_accounts_by_owner(&self.wallet_address, filter_spl)
             .await?;
 
+        let accounts_spl_2022 = self
+            .rpc_client
+            .get_token_accounts_by_owner(&self.wallet_address, filter_spl_2022)
+            .await?;
+            
+        // Combine results from both filters
+        accounts_spl.extend(accounts_spl_2022); 
+
+        let accounts = accounts_spl;
+        
         let mut balances = HashMap::new();
         info!("Found {} token accounts", accounts.len());
 
@@ -191,13 +206,10 @@ impl PortfolioTracker {
             if let solana_account_decoder::UiAccountData::Json(parsed_account) =
                 keyed_account.account.data
             {
-                // 1. Get the "info" object out of the parsed data
+                // ... the rest of your parsing logic remains the same ...
                 if let Some(info) = parsed_account.parsed.get("info") {
-                    // 2. Deserialize ONLY the info object into UiTokenAccount
                     if let Ok(token_data) = serde_json::from_value::<UiTokenAccount>(info.clone()) {
                         let token_amount = token_data.token_amount;
-                        // ... rest of your logic
-                        // println!("{:?}", token_amount);
                         if let Ok(amount_u64) = token_amount.amount.parse::<u64>() {
                             if amount_u64 > 0 {
                                 let mint: Pubkey = token_data.mint.parse()?;
@@ -207,7 +219,7 @@ impl PortfolioTracker {
                                     amount: amount_u64,
                                     decimals: token_amount.decimals,
                                     ui_amount: token_amount.ui_amount.unwrap_or(0.0),
-                                    symbol: self.get_token_symbol(mint).await, // Still needed for metadata
+                                    symbol: self.get_token_symbol(mint).await,
                                     name: self.get_token_name(mint).await,
                                 };
 
