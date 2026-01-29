@@ -8,9 +8,7 @@ use solana_account_decoder::parse_token::UiTokenAmount;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig};
 use solana_client::rpc_filter::{Memcmp, RpcFilterType};
-// use solana_client::rpc_request::TokenAccountOpts;
-// use colored::*;
-extern crate colored; // not needed in Rust 2018+
+extern crate colored;
 
 use colored::Colorize;
 use solana_account_decoder_client_types::token::UiTokenAccount;
@@ -26,7 +24,10 @@ use spl_token_2022;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::time::interval;
-use tracing::{debug, error, info, warn}; // Add colored crate for better output
+use tracing::{debug, error, info, warn};
+
+// Add this import for serde_json
+use serde_json;
 
 #[derive(Debug, Clone)]
 pub struct TokenBalance {
@@ -36,6 +37,22 @@ pub struct TokenBalance {
     pub amount: u64,
     pub symbol: Option<String>,
     pub name: Option<String>,
+}
+
+
+fn format_token_map(token_map: &HashMap<Pubkey, TokenBalance>) -> String {
+    token_map
+        .iter()
+        .map(|(mint, data)| {
+            format!(
+                "Mint: <code>{}</code> • Symbol: {} • Amount: {}",
+                mint, 
+                data.symbol.as_deref().unwrap_or("N/A"),
+                data.ui_amount
+            )
+        })
+        .collect::<Vec<String>>()
+        .join("")
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +70,9 @@ pub struct PortfolioTracker {
     token_metadata: Arc<DashMap<Pubkey, (String, String)>>, // mint -> (symbol, name)
     price_cache: Arc<DashMap<Pubkey, f64>>,                 // mint -> USD price
     decimals_cache: RwLock<HashMap<Pubkey, u8>>,
+    telegram_client: Option<reqwest::Client>,
+    telegram_token: Option<String>,
+    telegram_chat_id: Option<String>,
 }
 
 impl PortfolioTracker {
@@ -64,6 +84,18 @@ impl PortfolioTracker {
             },
         );
 
+        // Check for Telegram configuration
+        let telegram_token = std::env::var("TG_TOKEN").ok();
+        let telegram_chat_id = std::env::var("CHAT_ID").ok();
+        
+        let telegram_client = if telegram_token.is_some() && telegram_chat_id.is_some() {
+            info!("Telegram notifications enabled");
+            Some(reqwest::Client::new())
+        } else {
+            warn!("Telegram notifications disabled. Set TG_TOKEN and CHAT_ID in .env file to enable.");
+            None
+        };
+
         Self {
             rpc_client: Arc::new(client),
             wallet_address,
@@ -71,6 +103,44 @@ impl PortfolioTracker {
             token_metadata: Arc::new(DashMap::new()),
             price_cache: Arc::new(DashMap::new()),
             decimals_cache: RwLock::new(HashMap::new()),
+            telegram_client,
+            telegram_token,
+            telegram_chat_id,
+        }
+    }
+
+    /// Send Telegram notification
+    async fn send_telegram_notification(&self, message: &str) {
+        if let (Some(client), Some(token), Some(chat_id)) = (
+            &self.telegram_client,
+            &self.telegram_token,
+            &self.telegram_chat_id,
+        ) {
+            let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+            
+            let payload = serde_json::json!({
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": true
+            });
+
+            match client.post(&url).body(payload.to_string()).header("Content-Type", "application/json").send().await {
+                Ok(response) => {
+                    let response_status = response.status();
+                    if !response_status.is_success() {
+                        warn!("Telegram API error: Status {}", response_status);
+                        if let Ok(text) = response.text().await {
+                            warn!("Telegram API response: {}", text);
+                        }
+                    } else {
+                        debug!("Telegram notification sent successfully");
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to send Telegram notification: {}", e);
+                }
+            }
         }
     }
 
@@ -162,6 +232,26 @@ impl PortfolioTracker {
         info!("{} Total Portfolio Value: ${:.2}", "➤".green(), total_value);
         info!("{}", "=".repeat(80).green());
 
+        // Send Telegram notification for initial portfolio
+        let telegram_msg = format!(
+            "💰 <b>Portfolio Tracker Started</b>\n\n\
+            👛 <b>Wallet:</b> <code>{}</code>\n\
+            ⏰ <b>Time:</b> {}\n\
+            📊 <b>Total Tokens:</b> {}\n\
+            🪙 <b>SOL Balance:</b> ◎{:.4}\n\
+            💵 <b>Total Value:</b> ${:.2}\n\n\
+            <b>Balances: {:?}</b>\n\n
+            🔄 <i>Tracking started successfully!</i>",
+            self.wallet_address,
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
+            balances.len(),
+            sol_balance,
+            total_value,
+            format_token_map(&balances)
+        );
+        
+        self.send_telegram_notification(&telegram_msg).await;
+
         Ok(())
     }
 
@@ -184,20 +274,20 @@ impl PortfolioTracker {
         let filter_spl = TokenAccountsFilter::ProgramId(spl_token::id()); // Standard SPL Token
         let filter_spl_2022 = TokenAccountsFilter::ProgramId(spl_token_2022::id()); // SPL Token-2022
 
-        let mut accounts_spl = self
-            .rpc_client
-            .get_token_accounts_by_owner(&self.wallet_address, filter_spl)
-            .await?;
-
-        let accounts_spl_2022 = self
+        let mut accounts_spl_2022 = self
             .rpc_client
             .get_token_accounts_by_owner(&self.wallet_address, filter_spl_2022)
             .await?;
-            
-        // Combine results from both filters
-        accounts_spl.extend(accounts_spl_2022); 
 
-        let accounts = accounts_spl;
+        // let accounts_spl = self
+        //     .rpc_client
+        //     .get_token_accounts_by_owner(&self.wallet_address, filter_spl)
+        //     .await?;
+            
+        // // Combine results from both filters
+        // accounts_spl_2022.extend(accounts_spl); 
+
+        let accounts = accounts_spl_2022;
         
         let mut balances = HashMap::new();
         info!("Found {} token accounts", accounts.len());
@@ -206,7 +296,6 @@ impl PortfolioTracker {
             if let solana_account_decoder::UiAccountData::Json(parsed_account) =
                 keyed_account.account.data
             {
-                // ... the rest of your parsing logic remains the same ...
                 if let Some(info) = parsed_account.parsed.get("info") {
                     if let Ok(token_data) = serde_json::from_value::<UiTokenAccount>(info.clone()) {
                         let token_amount = token_data.token_amount;
@@ -347,7 +436,7 @@ impl PortfolioTracker {
         Err(anyhow::anyhow!("Token not in known list"))
     }
 
-    async fn fetch_metaplex_metadata(&self, mint: Pubkey) -> anyhow::Result<(String, String)> {
+    async fn fetch_metaplex_metadata(&self, _mint: Pubkey) -> anyhow::Result<(String, String)> {
         // Placeholder for Metaplex metadata fetching
         Err(anyhow::anyhow!("Metaplex metadata not implemented"))
     }
@@ -466,11 +555,14 @@ impl PortfolioTracker {
     }
 
     /// Start continuous tracking with configurable interval
-    pub async fn start_tracking(
-        self: Arc<Self>,
+    pub async fn start_tracking<F>(
+        &self,
         tick_interval_ms: u64,
-        mut on_portfolio_change: impl FnMut(PortfolioDiff) + Send + 'static,
-    ) -> anyhow::Result<()> {
+        mut on_portfolio_change: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(PortfolioDiff) + Send + 'static,
+    {
         let mut interval = interval(Duration::from_millis(tick_interval_ms));
 
         // Initial snapshot with logging
@@ -528,6 +620,62 @@ impl PortfolioDiff {
     pub fn is_empty(&self) -> bool {
         self.added.is_empty() && self.removed.is_empty() && self.changes.is_empty()
     }
+    
+    /// Format changes for Telegram
+    pub fn format_for_telegram(&self) -> String {
+        let mut lines = Vec::new();
+        
+        if !self.added.is_empty() || !self.removed.is_empty() || !self.changes.is_empty() {
+            lines.push("🔔 <b>Portfolio Changes Detected</b>".to_string());
+        }
+        
+        if !self.added.is_empty() {
+            lines.push("\n➕ <b>New Tokens Added:</b>".to_string());
+            for added in &self.added {
+                let symbol = added.symbol.as_deref().unwrap_or("Unknown");
+                lines.push(format!(
+                    "• {} ({})\n  Amount: {:.8}\n  Mint: <code>{}</code>",
+                    symbol,
+                    added.name.as_deref().unwrap_or("Unknown Token"),
+                    added.ui_amount,
+                    added.mint
+                ));
+            }
+        }
+        
+        if !self.removed.is_empty() {
+            lines.push("\n➖ <b>Tokens Removed:</b>".to_string());
+            for removed in &self.removed {
+                let symbol = removed.symbol.as_deref().unwrap_or("Unknown");
+                lines.push(format!(
+                    "• {} ({})\n  Mint: <code>{}</code>",
+                    symbol,
+                    removed.name.as_deref().unwrap_or("Unknown Token"),
+                    removed.mint
+                ));
+            }
+        }
+        
+        if !self.changes.is_empty() {
+            lines.push("\n📈 <b>Balance Changes:</b>".to_string());
+            for change in &self.changes {
+                let change_emoji = if change.change > 0.0 { "📈" } else { "📉" };
+                let change_sign = if change.change > 0.0 { "+" } else { "" };
+                lines.push(format!(
+                    "• {} Mint: <code>{}</code>\n  From: {:.8} → {:.8}\n  Change: {}{:.8} ({:.2}%)",
+                    change_emoji,
+                    change.mint,
+                    change.old_amount,
+                    change.new_amount,
+                    change_sign,
+                    change.change,
+                    change.percentage_change
+                ));
+            }
+        }
+        
+        lines.join("\n")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -564,6 +712,15 @@ fn main() -> anyhow::Result<()> {
         info!("RPC URL: {}", rpc_url);
         info!("Wallet Address: {}", wallet_address_str);
 
+        // Check for Telegram configuration
+        let telegram_enabled = std::env::var("TG_TOKEN").is_ok() && std::env::var("CHAT_ID").is_ok();
+        if telegram_enabled {
+            info!("Telegram notifications: {}", "ENABLED".green().bold());
+        } else {
+            info!("Telegram notifications: {}", "DISABLED".yellow().bold());
+            info!("Set TG_TOKEN and CHAT_ID in .env file to enable Telegram notifications");
+        }
+
         let wallet_address = Pubkey::from_str(&wallet_address_str)?;
 
         let tracker = Arc::new(PortfolioTracker::new(rpc_url, wallet_address));
@@ -573,49 +730,70 @@ fn main() -> anyhow::Result<()> {
             error!("Failed to log initial portfolio: {}", e);
         }
 
+        // Clone the tracker for the async task
+        let tracker_for_task = tracker.clone();
+        let tracker_for_telegram = tracker.clone();
+
         // Start tracking with 5 second intervals
-        let tracker_clone = tracker.clone();
         tokio::spawn(async move {
-            if let Err(e) = tracker_clone
-                .start_tracking(5000, |diff| {
+            if let Err(e) = tracker_for_task
+                .start_tracking(1100, move |diff| {
                     if !diff.is_empty() {
+                        // Console output with full mint addresses
                         info!("{}", "Portfolio changes detected:".bold().yellow());
+                        info!("{}", "-".repeat(80));
 
-                        for added in &diff.added {
-                            info!(
-                                "  {} Added: {} ({}) - {:.8}",
-                                "+".green(),
-                                added.symbol.as_deref().unwrap_or("Unknown"),
-                                added.mint.to_string()[0..8].to_string().dimmed(),
-                                added.ui_amount
-                            );
+                        if !diff.added.is_empty() {
+                            info!("{} NEW TOKENS ADDED:", "▶".green());
+                            for added in &diff.added {
+                                let symbol = added.symbol.as_deref().unwrap_or("Unknown");
+                                let name = added.name.as_deref().unwrap_or("Unknown Token");
+                                info!("  {} {} ({})", "+".green(), symbol, name);
+                                info!("     Mint: <code>{}</code>", added.mint.to_string());
+                                info!("     Amount: {:.8}", added.ui_amount);
+                                info!("     Full Mint Address: {}", added.mint.to_string().dimmed());
+                                info!("");
+                            }
                         }
 
-                        for removed in &diff.removed {
-                            info!(
-                                "  {} Removed: {} ({})",
-                                "-".red(),
-                                removed.symbol.as_deref().unwrap_or("Unknown"),
-                                removed.mint.to_string()[0..8].to_string().dimmed()
-                            );
+                        if !diff.removed.is_empty() {
+                            info!("{} TOKENS REMOVED:", "▶".red());
+                            for removed in &diff.removed {
+                                let symbol = removed.symbol.as_deref().unwrap_or("Unknown");
+                                let name = removed.name.as_deref().unwrap_or("Unknown Token");
+                                info!("  {} {} ({})", "-".red(), symbol, name);
+                                info!("     Mint: <code>{}</code>", removed.mint.to_string());
+                                info!("     Full Mint Address: {}", removed.mint.to_string().dimmed());
+                                info!("");
+                            }
                         }
 
-                        for change in &diff.changes {
-                            let change_emoji = if change.change > 0.0 {
-                                "↑".green()
-                            } else {
-                                "↓".red()
-                            };
+                        if !diff.changes.is_empty() {
+                            info!("{} BALANCE CHANGES:", "▶".yellow());
+                            for change in &diff.changes {
+                                let change_emoji = if change.change > 0.0 {
+                                    "↑".green()
+                                } else {
+                                    "↓".red()
+                                };
+                                
+                                info!("  {} Mint: <code>{}</code>", change_emoji, change.mint.to_string());
+                                info!("     From: {:.8} → {:.8}", change.old_amount, change.new_amount);
+                                info!("     Change: {:+.8} ({:.2}%)", change.change, change.percentage_change);
+                                info!("     Full Mint Address: {}", change.mint.to_string().dimmed());
+                                info!("");
+                            }
+                        }
 
-                            info!(
-                                "  {} Changed: {} - {:.8} → {:.8} (Δ: {:+.8}, {:.2}%)",
-                                change_emoji,
-                                change.mint.to_string()[0..8].to_string().dimmed(),
-                                change.old_amount,
-                                change.new_amount,
-                                change.change,
-                                change.percentage_change
-                            );
+                        info!("{}", "=".repeat(80));
+                        
+                        // Send Telegram notification
+                        let telegram_msg = diff.format_for_telegram();
+                        if !telegram_msg.is_empty() {
+                            let tracker_ref = tracker_for_telegram.clone();
+                            tokio::spawn(async move {
+                                tracker_ref.send_telegram_notification(&telegram_msg).await;
+                            });
                         }
                     }
                 })
@@ -629,6 +807,19 @@ fn main() -> anyhow::Result<()> {
 
         // Keep the program running
         tokio::signal::ctrl_c().await?;
+        
+        // Send shutdown notification
+        let shutdown_msg = format!(
+            "🛑 <b>Portfolio Tracker Stopped</b>\n\n\
+            👛 <b>Wallet:</b> <code>{}</code>\n\
+            ⏰ <b>Time:</b> {}\n\n\
+            <i>Tracker has been shut down.</i>",
+            tracker.wallet_address,
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
+        );
+        
+        tracker.send_telegram_notification(&shutdown_msg).await;
+        
         info!("Shutting down...");
 
         Ok(())
