@@ -39,14 +39,13 @@ pub struct TokenBalance {
     pub name: Option<String>,
 }
 
-
 fn format_token_map(token_map: &HashMap<Pubkey, TokenBalance>) -> String {
     token_map
         .iter()
         .map(|(mint, data)| {
             format!(
                 "Mint: <code>{}</code> • Symbol: {} • Amount: {}",
-                mint, 
+                mint,
                 data.symbol.as_deref().unwrap_or("N/A"),
                 data.ui_amount
             )
@@ -87,12 +86,14 @@ impl PortfolioTracker {
         // Check for Telegram configuration
         let telegram_token = std::env::var("TG_TOKEN").ok();
         let telegram_chat_id = std::env::var("CHAT_ID").ok();
-        
+
         let telegram_client = if telegram_token.is_some() && telegram_chat_id.is_some() {
             info!("Telegram notifications enabled");
             Some(reqwest::Client::new())
         } else {
-            warn!("Telegram notifications disabled. Set TG_TOKEN and CHAT_ID in .env file to enable.");
+            warn!(
+                "Telegram notifications disabled. Set TG_TOKEN and CHAT_ID in .env file to enable."
+            );
             None
         };
 
@@ -117,7 +118,7 @@ impl PortfolioTracker {
             &self.telegram_chat_id,
         ) {
             let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
-            
+
             let payload = serde_json::json!({
                 "chat_id": chat_id,
                 "text": message,
@@ -125,7 +126,13 @@ impl PortfolioTracker {
                 "disable_web_page_preview": true
             });
 
-            match client.post(&url).body(payload.to_string()).header("Content-Type", "application/json").send().await {
+            match client
+                .post(&url)
+                .body(payload.to_string())
+                .header("Content-Type", "application/json")
+                .send()
+                .await
+            {
                 Ok(response) => {
                     let response_status = response.status();
                     if !response_status.is_success() {
@@ -249,7 +256,7 @@ impl PortfolioTracker {
             total_value,
             format_token_map(&balances)
         );
-        
+
         self.send_telegram_notification(&telegram_msg).await;
 
         Ok(())
@@ -283,12 +290,12 @@ impl PortfolioTracker {
         //     .rpc_client
         //     .get_token_accounts_by_owner(&self.wallet_address, filter_spl)
         //     .await?;
-            
+
         // // Combine results from both filters
-        // accounts_spl_2022.extend(accounts_spl); 
+        // accounts_spl_2022.extend(accounts_spl);
 
         let accounts = accounts_spl_2022;
-        
+
         let mut balances = HashMap::new();
         info!("Found {} token accounts", accounts.len());
 
@@ -620,15 +627,15 @@ impl PortfolioDiff {
     pub fn is_empty(&self) -> bool {
         self.added.is_empty() && self.removed.is_empty() && self.changes.is_empty()
     }
-    
+
     /// Format changes for Telegram
     pub fn format_for_telegram(&self) -> String {
         let mut lines = Vec::new();
-        
+
         if !self.added.is_empty() || !self.removed.is_empty() || !self.changes.is_empty() {
             lines.push("🔔 <b>Portfolio Changes Detected</b>".to_string());
         }
-        
+
         if !self.added.is_empty() {
             lines.push("\n➕ <b>New Tokens Added:</b>".to_string());
             for added in &self.added {
@@ -642,7 +649,7 @@ impl PortfolioDiff {
                 ));
             }
         }
-        
+
         if !self.removed.is_empty() {
             lines.push("\n➖ <b>Tokens Removed:</b>".to_string());
             for removed in &self.removed {
@@ -655,7 +662,7 @@ impl PortfolioDiff {
                 ));
             }
         }
-        
+
         if !self.changes.is_empty() {
             lines.push("\n📈 <b>Balance Changes:</b>".to_string());
             for change in &self.changes {
@@ -673,7 +680,7 @@ impl PortfolioDiff {
                 ));
             }
         }
-        
+
         lines.join("\n")
     }
 }
@@ -685,6 +692,48 @@ pub struct TokenChange {
     pub new_amount: f64,
     pub change: f64,
     pub percentage_change: f64,
+}
+
+#[derive(serde::Serialize)]
+struct Message {
+    channel: String,
+    text: String,
+    timestamp: Option<String>,
+}
+
+// Create a global HTTP client (more efficient)
+lazy_static::lazy_static! {
+    static ref HTTP_CLIENT: reqwest::Client = reqwest::Client::new();
+}
+
+async fn send_message(token_address: String) -> anyhow::Result<()> {
+    let message = Message {
+        channel: "testpfun".to_string(),
+        text: format!("New token detected: {}", token_address),
+        // timestamp: chrono::Local::now().format("%H:%M").to_string(),
+        timestamp: Some("blank".to_string()),
+    };
+
+    let response: reqwest::Response = HTTP_CLIENT
+        .post("http://localhost:3000/message")
+        .json(&message)
+        .send()
+        .await?;
+
+    if response.status().is_success() {
+        info!("✅ Message sent successfully");
+    } else {
+        let error_text = response.text().await?;
+        warn!("❌ Failed to send message: {}", error_text);
+    }
+
+    Ok(())
+}
+
+fn send_message_sync(token_address: String) -> anyhow::Result<()> {
+    // Create a new runtime for synchronous execution
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(send_message(token_address))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -713,7 +762,8 @@ fn main() -> anyhow::Result<()> {
         info!("Wallet Address: {}", wallet_address_str);
 
         // Check for Telegram configuration
-        let telegram_enabled = std::env::var("TG_TOKEN").is_ok() && std::env::var("CHAT_ID").is_ok();
+        let telegram_enabled =
+            std::env::var("TG_TOKEN").is_ok() && std::env::var("CHAT_ID").is_ok();
         if telegram_enabled {
             info!("Telegram notifications: {}", "ENABLED".green().bold());
         } else {
@@ -746,12 +796,19 @@ fn main() -> anyhow::Result<()> {
                         if !diff.added.is_empty() {
                             info!("{} NEW TOKENS ADDED:", "▶".green());
                             for added in &diff.added {
+                                match send_message_sync(added.mint.to_string()) {
+                                    Ok(_) => println!("✅ Message sent successfully!"),
+                                    Err(e) => eprintln!("❌ Error sending message: {}", e),
+                                }
                                 let symbol = added.symbol.as_deref().unwrap_or("Unknown");
                                 let name = added.name.as_deref().unwrap_or("Unknown Token");
                                 info!("  {} {} ({})", "+".green(), symbol, name);
                                 info!("     Mint: <code>{}</code>", added.mint.to_string());
                                 info!("     Amount: {:.8}", added.ui_amount);
-                                info!("     Full Mint Address: {}", added.mint.to_string().dimmed());
+                                info!(
+                                    "     Full Mint Address: {}",
+                                    added.mint.to_string().dimmed()
+                                );
                                 info!("");
                             }
                         }
@@ -763,7 +820,10 @@ fn main() -> anyhow::Result<()> {
                                 let name = removed.name.as_deref().unwrap_or("Unknown Token");
                                 info!("  {} {} ({})", "-".red(), symbol, name);
                                 info!("     Mint: <code>{}</code>", removed.mint.to_string());
-                                info!("     Full Mint Address: {}", removed.mint.to_string().dimmed());
+                                info!(
+                                    "     Full Mint Address: {}",
+                                    removed.mint.to_string().dimmed()
+                                );
                                 info!("");
                             }
                         }
@@ -776,17 +836,30 @@ fn main() -> anyhow::Result<()> {
                                 } else {
                                     "↓".red()
                                 };
-                                
-                                info!("  {} Mint: <code>{}</code>", change_emoji, change.mint.to_string());
-                                info!("     From: {:.8} → {:.8}", change.old_amount, change.new_amount);
-                                info!("     Change: {:+.8} ({:.2}%)", change.change, change.percentage_change);
-                                info!("     Full Mint Address: {}", change.mint.to_string().dimmed());
+
+                                info!(
+                                    "  {} Mint: <code>{}</code>",
+                                    change_emoji,
+                                    change.mint.to_string()
+                                );
+                                info!(
+                                    "     From: {:.8} → {:.8}",
+                                    change.old_amount, change.new_amount
+                                );
+                                info!(
+                                    "     Change: {:+.8} ({:.2}%)",
+                                    change.change, change.percentage_change
+                                );
+                                info!(
+                                    "     Full Mint Address: {}",
+                                    change.mint.to_string().dimmed()
+                                );
                                 info!("");
                             }
                         }
 
                         info!("{}", "=".repeat(80));
-                        
+
                         // Send Telegram notification
                         let telegram_msg = diff.format_for_telegram();
                         if !telegram_msg.is_empty() {
@@ -807,7 +880,7 @@ fn main() -> anyhow::Result<()> {
 
         // Keep the program running
         tokio::signal::ctrl_c().await?;
-        
+
         // Send shutdown notification
         let shutdown_msg = format!(
             "🛑 <b>Portfolio Tracker Stopped</b>\n\n\
@@ -817,9 +890,9 @@ fn main() -> anyhow::Result<()> {
             tracker.wallet_address,
             chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
         );
-        
+
         tracker.send_telegram_notification(&shutdown_msg).await;
-        
+
         info!("Shutting down...");
 
         Ok(())
