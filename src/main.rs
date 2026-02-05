@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use anyhow::Context;
 
 use dashmap::DashMap;
 use solana_account_decoder::parse_token::UiTokenAmount;
@@ -710,11 +711,10 @@ async fn send_message(token_address: String) -> anyhow::Result<()> {
     let message = Message {
         channel: "testpfun".to_string(),
         text: format!("New token detected: {}", token_address),
-        // timestamp: chrono::Local::now().format("%H:%M").to_string(),
         timestamp: Some("blank".to_string()),
     };
 
-    let response: reqwest::Response = HTTP_CLIENT
+    let response = HTTP_CLIENT
         .post("http://localhost:3000/message")
         .json(&message)
         .send()
@@ -728,12 +728,6 @@ async fn send_message(token_address: String) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-fn send_message_sync(token_address: String) -> anyhow::Result<()> {
-    // Create a new runtime for synchronous execution
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(send_message(token_address))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -796,10 +790,13 @@ fn main() -> anyhow::Result<()> {
                         if !diff.added.is_empty() {
                             info!("{} NEW TOKENS ADDED:", "▶".green());
                             for added in &diff.added {
-                                match send_message_sync(added.mint.to_string()) {
-                                    Ok(_) => println!("✅ Message sent successfully!"),
-                                    Err(e) => eprintln!("❌ Error sending message: {}", e),
-                                }
+                                let mint_address = added.mint.to_string();
+                                tokio::spawn(async move {
+                                    match send_message(mint_address).await {
+                                        Ok(_) => println!("✅ Message sent successfully!"),
+                                        Err(e) => eprintln!("❌ Error sending message: {}", e),
+                                    }
+                                });
                                 let symbol = added.symbol.as_deref().unwrap_or("Unknown");
                                 let name = added.name.as_deref().unwrap_or("Unknown Token");
                                 info!("  {} {} ({})", "+".green(), symbol, name);
