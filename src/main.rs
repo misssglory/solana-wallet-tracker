@@ -735,7 +735,7 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_ansi(true)
         .with_level(true)
-        .with_target(true)
+        .with_target(false)
         .init();
 
     dotenvy::dotenv().ok();
