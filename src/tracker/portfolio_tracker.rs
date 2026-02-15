@@ -1,3 +1,4 @@
+//src/tracker/portfolio_tracker.rs
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -74,6 +75,15 @@ impl PortfolioTracker {
 
         if balances.is_empty() {
             info!("No token holdings found in wallet");
+            
+            // Create and send empty portfolio notification
+            let empty_message = self.format_initial_portfolio_message(&balances, 0.0).await;
+            self.event_handler.handle_portfolio_change(PortfolioDiff {
+                added: vec![],
+                removed: vec![],
+                changes: vec![],
+            }).await; // This will still trigger the handler
+            
             return Ok(());
         }
 
@@ -141,7 +151,74 @@ impl PortfolioTracker {
         info!("➤ Total Portfolio Value: ${:.2}", total_value);
         info!("{}", "=".repeat(80));
 
+        // Send initial portfolio notification through event handler
+        // We create a special diff for initial portfolio
+        let initial_diff = PortfolioDiff {
+            added: balances.values().cloned().collect(),
+            removed: vec![],
+            changes: vec![],
+        };
+        
+        self.event_handler.handle_portfolio_change(initial_diff).await;
+
         Ok(())
+    }
+
+    /// Format initial portfolio message for notifications
+    async fn format_initial_portfolio_message(&self, balances: &HashMap<Pubkey, TokenBalance>, total_value: f64) -> String {
+        let mut message = String::new();
+        let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S");
+        
+        message.push_str(&format!("🚀 <b>Portfolio Tracker Started</b>\n\n"));
+        message.push_str(&format!("⏰ <b>Time:</b> {}\n", timestamp));
+        message.push_str(&format!("👛 <b>Wallet:</b> <code>{}</code>\n", self.wallet_address));
+        message.push_str(&format!("📊 <b>Total Tokens:</b> {}\n\n", balances.len()));
+
+        if !balances.is_empty() {
+            message.push_str("<b>Holdings:</b>\n");
+            
+            // Sort balances by value (if price available) or amount
+            let mut balance_vec: Vec<&TokenBalance> = balances.values().collect();
+            
+            // Try to sort by USD value if prices available
+            let mut balance_with_value: Vec<(f64, &TokenBalance)> = Vec::new();
+            for balance in &balance_vec {
+                if let Some(price) = self.price_provider.get_token_price(&balance.mint).await {
+                    balance_with_value.push((balance.ui_amount * price, balance));
+                } else {
+                    balance_with_value.push((0.0, balance));
+                }
+            }
+            
+            // Sort by value descending
+            balance_with_value.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            
+            for (value, balance) in balance_with_value.iter().take(10) { // Show top 10
+                let symbol = balance.symbol.as_deref().unwrap_or("Unknown");
+                if *value > 0.0 {
+                    message.push_str(&format!("• {}: {:.4} (${:.2})\n", symbol, balance.ui_amount, value));
+                } else {
+                    message.push_str(&format!("• {}: {:.4}\n", symbol, balance.ui_amount));
+                }
+            }
+            
+            if balances.len() > 10 {
+                message.push_str(&format!("  ... and {} more\n", balances.len() - 10));
+            }
+            message.push_str("\n");
+        }
+
+        let sol_balance = match self.data_provider.fetch_sol_balance(&self.wallet_address).await {
+            Ok(bal) => bal,
+            Err(_) => 0.0,
+        };
+        
+        message.push_str(&format!("🪙 <b>SOL Balance:</b> ◎{:.4}\n", sol_balance));
+        message.push_str(&format!("💰 <b>Total Value:</b> ${:.2}\n", total_value));
+        message.push_str("\n");
+        message.push_str("🔄 <b>Tracking started successfully!</b>");
+
+        message
     }
 
     /// Take a snapshot of current portfolio
