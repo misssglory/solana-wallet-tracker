@@ -20,10 +20,18 @@ anyhow = "1.0"
 thiserror = "1.0"
 dashmap = "5.5"
 chrono = "0.4"
-spl-token = "9.0.0"
-spl-token-2022 = "10.0.0"
+spl-token = { version = "9.0.0", features = ["no-entrypoint"] }
+spl-token-2022 = { version = "10.0.0", features = ["no-entrypoint"] }
 dotenvy = "0.15.7"
 colored = "3.1.1"
 solana-account-decoder-client-types = "3.1.8"
 reqwest = { version = "0.13.1", features = ["json"] }
 lazy_static = "1.5.0"
+
+
+[profile.release]
+opt-level = 3
+lto = true        # Link Time Optimization for smaller/faster binary.
+codegen-units = 1 # Slower compilation, better optimization.
+panic = "abort"   # Reduces binary size (no unwinding).
+strip = "symbols"
