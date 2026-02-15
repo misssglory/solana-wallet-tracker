@@ -6,24 +6,25 @@ use solana_account_decoder::parse_token::UiTokenAccount;
 use solana_client::{
   nonblocking::{pubsub_client::PubsubClient, rpc_client::RpcClient},
   rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig},
-  rpc_filter::{Memcmp, RpcFilterType}, rpc_request::TokenAccountsFilter,
+  rpc_filter::{Memcmp, RpcFilterType},
+  rpc_request::TokenAccountsFilter,
 };
 use solana_commitment_config::{CommitmentConfig, CommitmentLevel};
-use solana_sdk::pubkey::Pubkey;
 use solana_program::program_pack::Pack;
+use solana_sdk::pubkey::Pubkey;
 use spl_token_2022::state::Mint;
-use std::{
-  collections::HashMap,
-  sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
-use tracing::info;
+use tracing::{error, info};
 
-use crate::{PortfolioDataProvider, TokenBalance};
-
-use tokio::sync::mpsc::{
-  unbounded_channel,
+use crate::{
+  PortfolioDataProvider,
+  TokenBalance,
+  models::portfolio::{PortfolioDiff, TokenChange}, // Add this import
+  notifications::NotificationQueue,                // Add this import
 };
+
+use tokio::sync::mpsc::unbounded_channel;
 
 pub struct WebSocketDataProvider {
   rpc_client: Arc<RpcClient>,
@@ -31,8 +32,10 @@ pub struct WebSocketDataProvider {
   subscription_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
   decimals_cache: Arc<RwLock<HashMap<Pubkey, u8>>>,
   wallet_address: Pubkey,
-  on_balance_update: Arc<dyn Fn(Pubkey, TokenBalance) + Send + Sync>,
+  notification_queue: NotificationQueue, // Replace callback with queue
   _pubsub_client: Arc<Mutex<Option<PubsubClient>>>,
+  // Store last known balances to calculate changes
+  last_balances: Arc<Mutex<HashMap<Pubkey, TokenBalance>>>,
 }
 
 impl WebSocketDataProvider {
@@ -40,7 +43,7 @@ impl WebSocketDataProvider {
     rpc_url: String,
     ws_url: String,
     wallet_address: Pubkey,
-    on_balance_update: Arc<dyn Fn(Pubkey, TokenBalance) + Send + Sync>,
+    notification_queue: NotificationQueue, // Change parameter type
   ) -> Self {
     let client = RpcClient::new_with_commitment(
       rpc_url,
@@ -53,8 +56,9 @@ impl WebSocketDataProvider {
       subscription_handles: Arc::new(Mutex::new(Vec::new())),
       decimals_cache: Arc::new(RwLock::new(HashMap::new())),
       wallet_address,
-      on_balance_update,
+      notification_queue, // Store queue
       _pubsub_client: Arc::new(Mutex::new(None)),
+      last_balances: Arc::new(Mutex::new(HashMap::new())),
     }
   }
 
@@ -145,9 +149,10 @@ impl WebSocketDataProvider {
       }
     });
 
-    // Spawn SOL balance handler
+    // Clone the notification queue and last_balances for the SOL handler
+    let notification_queue = self.notification_queue.clone();
     let wallet_address = self.wallet_address;
-    let on_balance_update = self.on_balance_update.clone();
+    let last_balances = self.last_balances.clone();
 
     let sol_handler = tokio::spawn(async move {
       while let Some(notification) = sol_rx.recv().await {
@@ -164,16 +169,51 @@ impl WebSocketDataProvider {
                 symbol: Some("SOL".to_string()),
                 name: Some("Solana".to_string()),
               };
-              on_balance_update(wallet_address, sol_balance);
+
+              // Get last known SOL balance
+              let mut last_balances_guard = last_balances.lock().await;
+              let last_sol =
+                last_balances_guard.get(&Pubkey::default()).cloned();
+
+              // Create diff if balance changed
+              if let Some(last) = last_sol {
+                if (last.ui_amount - sol_balance.ui_amount).abs() > f64::EPSILON
+                {
+                  let mut diff = PortfolioDiff::default();
+                  diff.changes.push(TokenChange {
+                    mint: Pubkey::default(),
+                    old_amount: last.ui_amount,
+                    new_amount: sol_balance.ui_amount,
+                    change: sol_balance.ui_amount - last.ui_amount,
+                    percentage_change: if last.ui_amount > 0.0 {
+                      ((sol_balance.ui_amount - last.ui_amount)
+                        / last.ui_amount)
+                        * 100.0
+                    } else {
+                      100.0
+                    },
+                  });
+                  notification_queue.notify_portfolio_change(diff);
+                }
+              } else {
+                // First time seeing SOL balance
+                let mut diff = PortfolioDiff::default();
+                diff.added.push(sol_balance.clone());
+                notification_queue.notify_portfolio_change(diff);
+              }
+
+              // Update last balance
+              last_balances_guard.insert(Pubkey::default(), sol_balance);
             }
           }
         }
       }
     });
 
-    // Spawn token balance handler
+    // Clone for token handler
+    let notification_queue = self.notification_queue.clone();
     let wallet_address = self.wallet_address;
-    let on_balance_update = self.on_balance_update.clone();
+    let last_balances = self.last_balances.clone();
 
     let token_handler = tokio::spawn(async move {
       while let Some(notification) = token_rx.recv().await {
@@ -197,7 +237,55 @@ impl WebSocketDataProvider {
                     symbol: None,
                     name: None,
                   };
-                  on_balance_update(wallet_address, balance);
+
+                  // Get last known balance for this mint
+                  let mut last_balances_guard = last_balances.lock().await;
+                  let last = last_balances_guard.get(&mint).cloned();
+
+                  // Create appropriate diff
+                  let mut diff = PortfolioDiff::default();
+
+                  match last {
+                    Some(last_balance) => {
+                      if (last_balance.ui_amount - balance.ui_amount).abs()
+                        > f64::EPSILON
+                      {
+                        diff.changes.push(TokenChange {
+                          mint,
+                          old_amount: last_balance.ui_amount,
+                          new_amount: balance.ui_amount,
+                          change: balance.ui_amount - last_balance.ui_amount,
+                          percentage_change: if last_balance.ui_amount > 0.0 {
+                            ((balance.ui_amount - last_balance.ui_amount)
+                              / last_balance.ui_amount)
+                              * 100.0
+                          } else {
+                            100.0
+                          },
+                        });
+                        notification_queue.notify_portfolio_change(diff);
+                      }
+                    }
+                    None => {
+                      diff.added.push(balance.clone());
+                      notification_queue.notify_portfolio_change(diff);
+                    }
+                  }
+
+                  // Update last balance
+                  last_balances_guard.insert(mint, balance);
+                } else {
+                  // Token balance became zero - check if we had it before
+                  let mint = Pubkey::from_str_const(&token_data.mint);
+                  let mut last_balances_guard = last_balances.lock().await;
+
+                  if let Some(removed_balance) =
+                    last_balances_guard.remove(&mint)
+                  {
+                    let mut diff = PortfolioDiff::default();
+                    diff.removed.push(removed_balance);
+                    notification_queue.notify_portfolio_change(diff);
+                  }
                 }
               }
             }

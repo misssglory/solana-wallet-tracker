@@ -11,6 +11,7 @@ pub mod handlers;
 pub mod tracker;
 pub mod utils;
 pub mod telegram_notifier;
+pub mod notifications;
 
 // Re-export commonly used items for easier access
 pub use models::{

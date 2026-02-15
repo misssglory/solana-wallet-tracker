@@ -1,4 +1,4 @@
-//src.main.rs
+// src/main.rs
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -12,28 +12,19 @@ use portfolio_tracker::{
     composite::CompositeEventHandler, console::ConsoleEventHandler,
     socket::SocketTokenEventHandler, telegram::TelegramEventHandler,
   },
-
-  // Models
   models::token::TokenBalance,
-
-  // Providers
+  notifications::NotificationQueue,
   providers::{
     price_provider::SimplePriceProvider, rpc_provider::RpcDataProvider,
     websocket_provider::WebSocketDataProvider,
   },
-
   telegram_notifier::TelegramNotifier,
-  // Tracker
   tracker::PortfolioTracker,
-
-  // Traits
   traits::{
     data_provider::PortfolioDataProvider,
     event_handler::{PortfolioEventHandler, TokenEventHandler},
     price_provider::PriceProvider,
   },
-
-  // Utils
   utils::parse_pubkey,
 };
 
@@ -78,40 +69,13 @@ async fn main() -> anyhow::Result<()> {
 
   let wallet_address = parse_pubkey(&wallet_address_str)?;
 
-  // Create data provider based on mode
-  let data_provider: Arc<dyn PortfolioDataProvider> =
-    if tracking_mode == "websocket" {
-      info!("Using WebSocket data provider (Helius style)");
-
-      rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("Failed to install AWS-LC-RS crypto provider");
-      // For WebSocket mode, we need a callback for real-time updates
-      let on_update = Arc::new(|wallet: Pubkey, balance: TokenBalance| {
-        info!(
-          "Real-time update for {}: {} {}",
-          wallet,
-          balance.ui_amount,
-          balance.mint.to_string() //   balance.symbol.as_deref().unwrap_or("Unknown")
-        );
-      });
-
-      Arc::new(WebSocketDataProvider::new(
-        rpc_url.clone(),
-        ws_url.clone(),
-        wallet_address,
-        on_update,
-      ))
-    } else {
-      info!("Using RPC polling data provider");
-      Arc::new(RpcDataProvider::new(rpc_url.clone()))
-    };
-
-  // Create price provider
+  // Create price provider (Arc can be cloned)
   let price_provider = Arc::new(SimplePriceProvider::new());
 
-  // Create event handlers
+  // Create composite handler
   let mut composite_handler = CompositeEventHandler::new();
+
+  // Add console handler immediately
   composite_handler.add_handler(Arc::new(ConsoleEventHandler::new()));
 
   // Add Telegram handler if configured
@@ -128,15 +92,43 @@ async fn main() -> anyhow::Result<()> {
     );
   }
 
+  // Wrap composite_handler in Arc so it can be cloned
+  let composite_handler_arc = Arc::new(composite_handler);
+
+  // Create notification queue with the handler
+  let notification_queue =
+    NotificationQueue::new(composite_handler_arc.clone());
+
   // Create token event handler for sockets
   let socket_handler = Arc::new(SocketTokenEventHandler::new());
 
-  // Create main tracker
+  // Create data provider based on mode
+  let data_provider: Arc<dyn PortfolioDataProvider> =
+    if tracking_mode == "websocket" {
+      info!("Using WebSocket data provider (Helius style)");
+
+      rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install AWS-LC-RS crypto provider");
+
+      // Pass the notification queue
+      Arc::new(WebSocketDataProvider::new(
+        rpc_url.clone(),
+        ws_url.clone(),
+        wallet_address,
+        notification_queue.clone(), // Pass the queue
+      ))
+    } else {
+      info!("Using RPC polling data provider");
+      Arc::new(RpcDataProvider::new(rpc_url.clone()))
+    };
+
+  // Create main tracker - pass cloned Arc
   let mut tracker = PortfolioTracker::new(
     wallet_address,
     data_provider.clone(),
-    price_provider,
-    Arc::new(composite_handler),
+    price_provider.clone(),        // Clone the Arc
+    composite_handler_arc.clone(), // Pass the cloned Arc
   );
 
   tracker.add_token_event_handler(socket_handler);
